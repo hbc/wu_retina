@@ -1,0 +1,304 @@
+```{r setup, echo=FALSE}
+opts_chunk$set(tidy=TRUE, highlight=TRUE, fig.align='left', fig.show='hold',
+               cache=FALSE, highlight=TRUE, autodep=TRUE, warning=FALSE, error=FALSE,
+               message=FALSE, prompt=TRUE, comment='', fig.cap='', fig.width=8,
+               fix.height=11, base.dir="/Users/rory/hsph/hsph/projects/wu_retina/retina/work/final/2014-03-31_retina/")
+```
+
+# Overview and setup
+This project is a simple two-factor RNA-seq comparison of the transcriptomes of cells in the
+retina from a wildtype mouse (CD) and a diseased mouse (FVB). There are four replicates
+for each condition. The libraries were created with the TruSeq kit and were sequenced
+paired-end, 50 bp each read.
+
+A wrinkle with the design is several of the samples 18336-18341 were run on the
+sequencer twice. The lane they were run in had some quality issues resulting in less reads
+than normal. This was handled by just catting the FASTQ files of these samples together
+and running it as a single deeper sequencing lane.
+
+```{r utility-functions}
+ensembl_gene = "mmusculus_gene_ensembl"
+filter_type = "ensembl_gene_id"
+gene_symbol = "mgi_symbol"
+annotate_df = function(d) {
+	require(biomaRt)
+	ensembl = useMart('ensembl', dataset = ensembl_gene)
+	a = getBM(attributes=c(filter_type, gene_symbol, "description"),
+		filters=c(filter_type), values=rownames(d),
+		mart=ensembl)
+	m = merge(d, a, by.x="row.names", by.y=filter_type)
+	return(m)
+}
+```
+
+
+```{r qc-setup}
+library(ggplot2)
+library(reshape)
+library(gplots)
+library(edgeR)
+library(CHBUtils)
+project_summary = "/Users/rory/hsph/hsph/projects/wu_retina/retina_new/work/final/2014-04-01_retina_new/project-summary.csv"
+counts_file = "/Users/rory/hsph/hsph/projects/wu_retina/retina_new/work/final/2014-04-01_retina_new/combined.counts"
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442",
+"#0072B2", "#D55E00", "#CC79A7")
+summarydata = read.table(project_summary, header=TRUE, sep=",")
+summarydata = summarydata[order(summarydata$Name),]
+counts = read.table(counts_file, header=TRUE, row.names="id")
+counts = counts[, order(colnames(counts))]
+```
+
+
+# Quailty control
+
+Looking at a subset of the libraries, there seems to be some quality issues with these
+libraries-- the actually quality plots look totally fine. Here is a representative example:
+
+![](images/quality_ok.png)
+
+But the mapping rate was low for the libraries, only about 50% of the reads aligned.
+Looking at the kmer plot shows there is a contaminating sequence at the beginning of
+a large number of the reads:
+
+![](images/CD1036_sequence_content.png)
+
+From this we can even read off what the adapter sequence as
+TATAGAATTCGCGGCCGCTCGCGA, which from Google BLASTing seems to be some kind
+of anchor T primer. Where did this primer come from? Something during the first
+strand synthesis?
+
+Looking at the FASTQ plot of each individual end, prior to read trimming we can
+see there is also a long stretch of poly-T on many reads:
+
+![](images/polyT.png)
+
+This also exists in all libraries, for both ends of the reads.
+So it seems like a significant portion of the library is made up of the sequence
+TATAGAATTCGCGGCCGCTCGCGATTTTTTTTTTTTTTTTTTTTTTTTTTT.
+
+This sequence appears anywhere from 1 to 6 million times in the reads of the
+samples. I added this sequence as a custom sequence to be trimmed off of the
+reads and reran the pipeline. This removed that contaminating sequence nicely:
+
+![](images/kmer_fixed.png)
+
+```{r mapped-plot}
+ggplot(summarydata, aes(x=Name, y=Mapped)) + 
+    geom_bar(stat="identity") +
+    theme(axis.text.x = element_text(angle = 90)) +
+    ylab("mapped reads") + xlab("")
+```
+
+And bumps the mapping rate up to something more respectable than 50%:
+
+```{r mapping-rate-plot}
+ggplot(summarydata, aes(x=Name, y=Mapping.Rate)) + 
+    geom_bar(stat="identity") +
+    theme(axis.text.x = element_text(angle = 90)) +
+    ylab("mapping rate")
+```
+
+There is some worrisome variation in the libraries. For example CD1036 and CD1037 have
+a much lower number of detected genes than the other libraries. 
+
+```{r genes-detected-plot}
+ggplot(summarydata, aes(x=Name, y=Genes.Detected)) +
+    geom_bar(stat="identity") +
+    theme(axis.text.x = element_text(angle = 90)) + 
+    ylab("genes detected")
+```
+
+The reads map to genes at about the same rate in all of the libraries, so the lower
+gene detection in CD1036 and CD1037 might be due to reduced library complexity; this
+occurs when a small number of sequences soak up many of the reads. This can occur for
+a few reasons, but the most common are more rRNA contamination and PCR artifacts through
+performing too many rounds of library amplification via PCR.
+
+```{r intragenic-rate-plot}
+ggplot(summarydata, aes(x=Name, y=1-Intergenic.Rate)) + 
+    geom_bar(stat="identity") +
+    theme(axis.text.x = element_text(angle = 90)) +
+    ylab("intragenic rate")
+```
+
+Looking at the distribution of counts, there are many genes in the CD1037 sample
+with much less counts per gene than the other samples.
+
+```{r boxplot-raw}
+melted = melt(counts)
+colnames(melted) = c("sample", "count")
+melted$sample = factor(melted$sample)
+melted$count = log(melted$count)
+ggplot(melted, aes(x=sample, y=count)) + geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Normalizing the libraries with TMM normalization lessens the impact of
+reads falling into a small set of genes, but this does not entirely fix the
+read distribution issue.
+
+```{r boxplot-normalized}
+y = DGEList(counts=counts)
+y = calcNormFactors(y)
+normalized_counts = cpm(y, normalized.lib.sizes=TRUE)
+melted = melt(normalized_counts)
+colnames(melted) = c("gene", "sample", "count")
+melted$sample = factor(melted$sample)
+melted$count = log(melted$count)
+ggplot(melted, aes(x=sample, y=count)) + geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+mds(normalized_counts, k=length(colnames(normalized_counts)) - 1)
+```
+
+
+Looking at the MDS plot we can see a couple of features. The first is
+that the range on the axis are huge, these samples are very different
+from each other, even the replicates that look like they are clustered
+together. The second feature is that samples CD1036 and CD1037 are off
+in the weeds as compared to all of the other samples. Is there
+anything that was done differently with these two samples as compared
+to the others during library preparation? Was the dissection of the
+retina different? Was the RNA extracted in a different manner?
+
+Below is a heatmap of the correlation of each sample to the other samples:
+```{r heatmap-normalized}
+heatmap.2(cor(normalized_counts), trace="none")
+```
+
+The samples seem to cluster well by if they are from the FVB or CD
+mouse, with CD1036 off in the weeds on its own. The overall
+correlations are much, much lower than expected, though, even among
+replicates:
+
+```{r correlation-table, results='asis'}
+kable(cor(normalized_counts), format="markdown")
+```
+
+
+Looking at the top genes doesn't give us too many insights, if it was a rRNA
+contamination issue we would expect to see rRNA as the top hits, which does not
+seem to be the case:
+
+```{r high-count-genes, results='asis'}
+topcounts = head(counts[order(-rowSums(counts)),])
+kable(annotate_df(topcounts), format="markdown")
+```
+
+It looks like the samples were not gender matched, but it doesn't
+correspond to the differences with CD1036 and CD1037. It looks like
+samples CD1038 and FV040 are female.
+
+```{r gender-mismatch, results='asis'}
+annotated = annotate_df(counts)
+kable(subset(annotated, mgi_symbol == "Xist"), format="markdown")
+```
+
+There are two mysteries. The first is that the samples are very different from each
+other, even among replicates. The second is that CD1036 and CD1037 are wildly different
+than all of the other samples.
+
+# Variation between samples
+As we saw above from the correlation plots, the variation between the samples
+is very high. We can see this clearly looking at a plot of the biological variation:
+
+```{r biological-variation}
+library(edgeR)
+# toss the genes that don't have counts > 5 in at least two samples
+keep = rowSums(counts > 5) >=2
+counts_filtered = counts[keep,]
+edgeR.dgelist = DGEList(counts=counts_filtered, group=class)
+edgeR.dgelist = calcNormFactors(edgeR.dgelist, method = "TMM")
+edgeR.dgelist = estimateCommonDisp(edgeR.dgelist)
+edgeR.dgelist = estimateTagwiseDisp(edgeR.dgelist)
+bcv(edgeR.dgelist)
+```
+
+The mean variation is over 2, that is extremely high, I have never
+seen samples with variation that high. For replicates taken from a
+reasonably variable experiment, for example from tumors of different human
+patients we would expect the variation to be close to 0.4. That means that
+the coefficient of variation of expression is sqrt(2.2) = 1.5, which means
+the variation is 1.5 times larger than the mean.
+
+We can visualize the variation by looking at plots of the counts for replicates.
+For example looking at FV040 and FV041:
+
+```{r pairwise-variation}
+qplot(log(normalized_counts[,c("FV040")] + 0.5), log(normalized_counts[, c("FV041")] + 0.5)) +
+  xlab("FC040") + ylab("FC041")
+```
+
+Just to check there has not been a large regression in the output of
+our pipeline I ran the pipeline on a subset of the SEQC dataset, which
+is a benchmark dataset put out by the FDA. The replicates in this
+sample are technical replicates so the variation should be very
+low. Below is the biological variation plot and an example of plotting
+two replicates against each other. 
+
+```{r seqc-counts}
+seqc = read.table("../metadata/seqc.counts", header=TRUE, row.names="id", sep="\t")
+keep = rowSums(seqc > 5) >= 2
+seqc = seqc[keep,]
+groups = c(1, 0, 1, 0, 1, 0, 1, 0, 1, 0)
+seqc_dge = DGEList(counts=seqc, group=groups)
+seqc_dge = calcNormFactors(seqc_dge, method="TMM")
+seqc_dge = estimateCommonDisp(seqc_dge)
+seqc_dge = estimateTrendedDisp(seqc_dge)
+seqc_dge = estimateTagwiseDisp(seqc_dge)
+bcv(seqc_dge)
+normalized_seqc = cpm(seqc_dge, normalized.lib.sizes=TRUE)
+qplot(log(normalized_seqc[,c("UHRR_rep1")] + 0.5),
+  log(normalized_seqc[, c("UHRR_rep2")] + 0.5)) +
+  xlab("UHRR_rep1") + ylab("UHRR_rep2")
+```
+
+From these plots it looks like the pipeline is working properly so there is
+something up with the samples.
+
+# Differential expression with DESeq2
+For simple two-factor comparisons, DESseq2 performs the best using simulated data,
+so we will use that to perform the differential expression.
+
+
+```{r de-deseq2}
+library(DESeq2)
+class = summarydata$organism
+dds = DESeqDataSetFromMatrix(countData=counts,
+    colData=data.frame(condition=class), design = ~ condition)
+dds = DESeq(dds)
+res = results(dds, independentFiltering=TRUE)
+res$id = rownames(res)
+comparison = paste(levels(class)[1], "_vs_", levels(class)[2], sep="")
+out_file = paste(comparison, "_de.tsv", sep="")
+out_table = data.frame(id=res$id, expr=res$baseMean, logFC=res$log2FoldChange,
+          pval=res$pvalue, padj=res$padj)
+write.table(out_table, file=out_file, quote=FALSE, row.names=FALSE,
+            sep="\t")
+
+de = data.frame(subset(res, padj < 0.05))
+annotated = annotate_df(de)
+```
+
+It looks like using a FDR cutoff of 0.05 there are `r nrow(de)` genes that are different.
+
+```{r output-table, results='asis'}
+kable(annotated, format="markdown")
+```
+
+But the results look pretty strange. The MA plot below looks bizarre, you can see tracks where
+the fold change is and mean expression is similar for a range of genes, it almost looks
+like there was some data spiked into these samples somehow. 
+
+```{r looking-results}
+plotMA(dds)
+```
+
+There are also instances in the data where several samples have thousands of reads mapping to
+a gene, but a random sample has none. For example, ENSMUSG00000025917 has that feature:
+
+![](images/ENSMUSG00000025917.png)
+
+And we saw above that there is a lot of variation in these samples we were not expecting to
+see. I think there is something up the way the samples are prepared that is causing these
+wild variations from sample to sample. It would be a good idea to try to track down
+what is happening before any additional experiments are run.
